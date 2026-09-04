@@ -27,6 +27,7 @@ public class ChangeLog {
     // FhirPatch path - this stands in for one.
     private static final String CONDITION_PATH = "condition";
     private static final String PRIORITY_PATH = "priority";
+    private static final String CODE_PATH = "code";
 
     public ChangeLog(String url) {
         this.pages = new ArrayList<>();
@@ -57,14 +58,16 @@ public class ChangeLog {
                 && !sourceResource.getUrl().equals(targetResource.getUrl())) {
             throw new UnprocessableEntityException(URLS_DONT_MATCH);
         }
-        // Map< [Code], [Object with code, version, system, etc.] > - one per side.
+        // Map< [leafOid|system|code], [Object with code, version, system, etc.] > - one per side.
         //
         // These used to be a single shared map, which meant a code present in both expansions became one
         // Code object appearing in both sides' lists. This meant that the new side reported the old
         // side's values. It also meant a single logical change reached the same instance twice,
         // once via each side, which Code.setOperation could not distinguish from a contradiction.
-        Map<String, ValueSetChild.Code> sourceCodeMap = new HashMap<>();
-        Map<String, ValueSetChild.Code> targetCodeMap = new HashMap<>();
+        //
+        // Ordered, because the codes are reported in the order they are collected.
+        Map<String, ValueSetChild.Code> sourceCodeMap = new LinkedHashMap<>();
+        Map<String, ValueSetChild.Code> targetCodeMap = new LinkedHashMap<>();
         // Map< [URL], Map <[Version], [Object with name, version, and other metadata] >>
         Map<String, Map<String, ValueSetChild.Leaf>> leafMetadataMap = new HashMap<>();
         updateCodeMapAndLeafMetadataMap(sourceCodeMap, leafMetadataMap, sourceResource, cache);
@@ -78,7 +81,6 @@ public class ChangeLog {
                         sourceResource.getName(),
                         sourceResource.getUrl(),
                         sourceResource.getCompose().getInclude(),
-                        sourceResource.getExpansion().getContains(),
                         sourceCodeMap,
                         leafMetadataMap,
                         getPriority(sourceResource).orElse(null));
@@ -91,14 +93,35 @@ public class ChangeLog {
                         targetResource.getName(),
                         targetResource.getUrl(),
                         targetResource.getCompose().getInclude(),
-                        targetResource.getExpansion().getContains(),
                         targetCodeMap,
                         leafMetadataMap,
                         getPriority(targetResource).orElse(null));
+        markCodeChanges(sourceCodeMap, targetCodeMap);
         var url = getPageUrl(sourceResource, targetResource);
         var page = new Page<>(url, oldData, newData);
         this.pages.add(page);
         return page;
+    }
+
+    /**
+     * A code's change is decided by comparing the two sides' membership, keyed by leaf, system and code.
+     *
+     * <p>The FhirPatch diff reports the grouper's own expansion, which cannot see a code that left one
+     * referenced value set while remaining in the grouper through another. The manual change log
+     * reports that as a removal from the value set that dropped it, so this does too.
+     */
+    private static void markCodeChanges(
+            Map<String, ValueSetChild.Code> sourceCodeMap, Map<String, ValueSetChild.Code> targetCodeMap) {
+        sourceCodeMap.forEach((key, code) -> {
+            if (!targetCodeMap.containsKey(key)) {
+                code.setOperation(new Operation(DELETE, CODE_PATH, null, code.getCodeValue()));
+            }
+        });
+        targetCodeMap.forEach((key, code) -> {
+            if (!sourceCodeMap.containsKey(key)) {
+                code.setOperation(new Operation(INSERT, CODE_PATH, code.getCodeValue(), null));
+            }
+        });
     }
 
     public String getPageUrl(MetadataResource source, MetadataResource target) {
@@ -170,16 +193,14 @@ public class ChangeLog {
     private void handleValueSetContains(
             Map<String, ValueSetChild.Code> codeMap, ValueSet valueSet, ValueSetChild.Leaf leafData) {
         valueSet.getExpansion().getContains().forEach(cnt -> {
-            if (!codeMap.containsKey(cnt.getCode())) {
-                updateLeafData(cnt.getSystem(), leafData);
-                mapExpansionContainsToCodeMap(
-                        codeMap,
-                        cnt,
-                        Canonicals.getIdPart(valueSet.getUrl()),
-                        valueSet.getName(),
-                        valueSet.getTitle(),
-                        valueSet.getUrl());
-            }
+            updateLeafData(cnt.getSystem(), leafData);
+            mapExpansionContainsToCodeMap(
+                    codeMap,
+                    cnt,
+                    Canonicals.getIdPart(valueSet.getUrl()),
+                    valueSet.getName(),
+                    valueSet.getTitle(),
+                    valueSet.getUrl());
         });
     }
 
@@ -235,7 +256,7 @@ public class ChangeLog {
         var inactive = containsComponent.hasInactive() ? containsComponent.getInactive() : null;
         var code = new ValueSetChild.Code(
                 id, system, codeValue, version, display, inactive, source, name, title, url, null);
-        codeMap.put(codeValue, code);
+        codeMap.put(createUniqueCodeKey(source, containsComponent.getSystem(), codeValue), code);
     }
 
     // What the expansion recorded about a code that compose.include cannot express.
@@ -246,15 +267,16 @@ public class ChangeLog {
         if (!valueSet.getExpansion().hasContains()) {
             return Map.of();
         }
-        Map<String, ExpansionDetail> detailsByCode = new HashMap<>();
+        Map<String, ExpansionDetail> detailsByUniqueCodeKey = new HashMap<>();
         valueSet.getExpansion().getContains().forEach(contained -> {
             if (!contained.hasCode()) {
                 return;
             }
             // First entry to state a thing wins, per field. Taking the first entry wholesale would let a
             // contains entry with no version block a later one that has it.
-            detailsByCode.compute(
-                    contained.getCode(),
+            detailsByUniqueCodeKey.compute(
+                    createUniqueCodeKey(
+                            Canonicals.getIdPart(valueSet.getUrl()), contained.getSystem(), contained.getCode()),
                     (k, existing) -> new ExpansionDetail(
                             firstNonNull(
                                     existing == null ? null : existing.version(),
@@ -263,11 +285,19 @@ public class ChangeLog {
                                     existing == null ? null : existing.inactive(),
                                     contained.hasInactive() ? contained.getInactive() : null)));
         });
-        return detailsByCode;
+        return detailsByUniqueCodeKey;
     }
 
     private static <T> T firstNonNull(T preferred, T fallback) {
         return preferred != null ? preferred : fallback;
+    }
+
+    /**
+     * A code string is only unique within its code system, so keying the version lookup on the code
+     * alone would hand a concept the version of an unrelated system that happens to use the same code.
+     */
+    private static String createUniqueCodeKey(String memberOid, String system, String code) {
+        return memberOid + "|" + (system == null ? "" : system) + "|" + code;
     }
 
     private void mapConceptSetToCodeMap(
@@ -284,24 +314,21 @@ public class ChangeLog {
         concept.getConcept().stream()
                 .filter(ValueSet.ConceptReferenceComponent::hasCode)
                 .forEach(conceptReference -> {
-                    if (!codeMap.containsKey(conceptReference.getCode())) {
-                        var detail = expansionDetails.get(conceptReference.getCode());
-                        var code = new ValueSetChild.Code(
-                                id,
-                                system,
-                                conceptReference.getCode(),
-                                version == null || version.isBlank()
-                                        ? (detail == null ? null : detail.version())
-                                        : version,
-                                conceptReference.getDisplay(),
-                                detail == null ? null : detail.inactive(),
-                                source,
-                                name,
-                                title,
-                                url,
-                                null);
-                        codeMap.put(conceptReference.getCode(), code);
-                    }
+                    var key = createUniqueCodeKey(source, system, conceptReference.getCode());
+                    var detail = expansionDetails.get(key);
+                    var code = new ValueSetChild.Code(
+                            id,
+                            system,
+                            conceptReference.getCode(),
+                            version == null || version.isBlank() ? (detail == null ? null : detail.version()) : version,
+                            conceptReference.getDisplay(),
+                            detail == null ? null : detail.inactive(),
+                            source,
+                            name,
+                            title,
+                            url,
+                            null);
+                    codeMap.put(key, code);
                 });
     }
 
