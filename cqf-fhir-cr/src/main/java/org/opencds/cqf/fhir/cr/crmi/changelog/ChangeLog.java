@@ -127,7 +127,8 @@ public class ChangeLog {
             } else if (Boolean.TRUE.equals(code.getInactive()) && !Boolean.TRUE.equals(previous.getInactive())) {
                 code.setOperation(new Operation(INACTIVE, CODE_PATH, code.getInactive(), previous.getInactive()));
             } else if (!Objects.equals(code.getDisplay(), previous.getDisplay())) {
-                code.setOperation(new Operation(UPDATED_DESCRIPTION, CODE_PATH, code.getDisplay(), previous.getDisplay()));
+                code.setOperation(
+                        new Operation(UPDATED_DESCRIPTION, CODE_PATH, code.getDisplay(), previous.getDisplay()));
             }
         });
     }
@@ -271,7 +272,7 @@ public class ChangeLog {
         var inactive = containsComponent.hasInactive() ? containsComponent.getInactive() : null;
         var code = new ValueSetChild.Code(
                 id, system, codeValue, version, display, inactive, source, name, title, url, null);
-        codeMap.put(createUniqueCodeKey(source, containsComponent.getSystem(), codeValue), code);
+        codeMap.putIfAbsent(createUniqueCodeKey(source, containsComponent.getSystem(), codeValue), code);
     }
 
     // What the expansion recorded about a code that compose.include cannot express.
@@ -502,8 +503,7 @@ public class ChangeLog {
                 // A leaf the other side does not hold is already reported by its own insert or delete,
                 // and every condition and priority it carries arrived or left along with it. Marking
                 // those states nothing.
-                var leafOperationType =
-                        otherSide.leafOids().contains(leaf.getMemberOid()) ? operationType : null;
+                var leafOperationType = otherSide.leafOids().contains(leaf.getMemberOid()) ? operationType : null;
                 for (final var condition : conditionsOf(relatedArtifact)) {
                     var statedOnOtherSide = otherSide.conditionKeys().contains(conditionKey(leaf, condition));
                     leaf.tryAddCondition(
@@ -517,10 +517,7 @@ public class ChangeLog {
     /**
      * Conditions live in a collection of extensions on the manifest's relatedArtifact entries, and the
      * diff reports collection membership positionally, so rebuilding that collection between releases
-     * produced an operation for almost every condition whether or not its content moved. On a real
-     * 3.1.2 -> 3.2.0 run that was 1368 operations, 1364 of them on conditions both sides state
-     * unchanged, while only 4 of the 22 genuine differences carried one at all. The operation is
-     * therefore derived from comparing the sides, and has no FhirPatch path of its own.
+     * produced an operation for almost every condition whether or not its content moved.
      */
     private static Operation conditionOperation(CodeableConcept condition, String operationType) {
         if (operationType == null) {
